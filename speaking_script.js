@@ -3,8 +3,8 @@ import "dotenv/config";
 const CONFIG = {
   baseUrl: "https://corporate.bharatenglish.org",
   orgSlug: "lpu724598",
-  userId: "12505798",
-  userEmail: "12505798@lpu.in",
+  userId: "1250xxxx",  // Use your registration id
+  userEmail: "1250xxxx@lpu.in",  // Use your registration id
   betExamIds: [],
   authToken: process.env.TOKEN,
   cookie: "",
