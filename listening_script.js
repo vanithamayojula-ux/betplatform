@@ -5,12 +5,12 @@ const CONFIG = {
   orgSlug: "lpu724598",
   userId: "12505798",
   userEmail: "12505798@lpu.in",
-  betExamIds: [], // L02 Morning Greetings retry 7653304
+  betExamIds: [],
   authToken: process.env.TOKEN,
   cookie: "",
   autoDiscover: true,
   betSectionInstId: "177434",
-  betSectionUnitInstId: "941823", // 01 Work Place Greetings (Listening)
+  betSectionUnitInstId: "941823",
   maxAutoLessons: 15,
   groqKey: process.env.GROQ_KEY,
   sarvamKey: process.env.SARVAM_KEY,
@@ -134,7 +134,7 @@ async function submitAnswer(examId, q, pick) {
     spch_selected_answer: null,
     subjective_written_answer: null,
   };
-  // also handle AMCQ vs MCQ: use amcq_selected_answer for AMCQ
+
   console.log(`[POST] ${url} uuid=${q.uuid} pick=${pick}`);
   let res;
   for (let a = 0; a < 3; a++) {
@@ -176,7 +176,7 @@ async function processExam(examId) {
       q.amcq?.option4,
     ];
     let pick;
-    // AI answers like Speaking: Whisper -> Groq pick (not answer field guess)
+
     if (audioUrl) {
       try {
         const transcript = await groqWhisperTranscribe(audioUrl);
@@ -286,8 +286,8 @@ async function main() {
     console.warn("WARN: Set TOKEN env var");
   if (CONFIG.betExamIds.length > 0) {
     console.log("Starting manual mode for exams:", CONFIG.betExamIds);
-    // manual needs lessonMap if you use betExamIds — add here
-    const lessonMap = { 648836400: "5539753", 648897900: "7653304" }; // L01 + L02 retry
+
+    const lessonMap = { 648836400: "5539753", 648897900: "7653304" };
     for (const id of CONFIG.betExamIds) {
       try {
         const lid = lessonMap[id] || null;

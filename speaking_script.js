@@ -14,16 +14,13 @@ const CONFIG = {
   maxAutoLessons: 15,
   impromptuAudioUrl:
     "https://images1.wexledu.com/lpu724598/speech-uploads/e8b20c15-ad03-42c2-8dc3-decde93c0745.mp3",
-  useSameAudioForAll: false, // false now uses Groq+Sarvam per-Q for >60%
-  // LLM + TTS for >60% (set via env, not hardcoded)
+  useSameAudioForAll: false,
   groqKey: process.env.GROQ_KEY,
   sarvamKey: process.env.SARVAM_KEY,
   groqModel: "openai/gpt-oss-20b",
-  sarvamSpeaker: "shubh", // en-IN male compatible with bulbul:v3
-  // delay between requests to avoid hammering dev server
+  sarvamSpeaker: "shubh",
   delayMs: 800,
-  scoreWaitMs: 5000, // wait S3 replication + scorer before :submit
-  // if true, re-use existing answer_audio_path instead of re-uploading
+  scoreWaitMs: 5000,
   preferExistingAudio: false,
 };
 
@@ -38,16 +35,12 @@ const headers = {
 if (CONFIG.authToken) headers["Authorization"] = CONFIG.authToken;
 if (CONFIG.cookie) headers["Cookie"] = CONFIG.cookie;
 
-// ignore self-signed cert for localhost - Node fetch needs this
-// run with: NODE_TLS_REJECT_UNAUTHORIZED=0 node script.js  (dev only)
 if (CONFIG.baseUrl.includes("localhost")) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Minimal 1-sec silent MP3 (valid) as fallback if no source audio
-// This is a base64 encoded tiny MP3 - avoids needing a file on disk
 const SILENT_MP3_BASE64 =
   "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAASAAAeAAABhgZGF0YQAAAAA=";
 
@@ -62,7 +55,7 @@ async function fetchQuestions(examId) {
   if (!res.ok)
     throw new Error(`GET questions failed ${res.status} ${await res.text()}`);
   const data = await res.json();
-  // Flatten all questions from all sections
+
   const questions = (data.test_definition_section || []).flatMap(
     (s) => s.questions || [],
   );
@@ -77,7 +70,7 @@ async function uploadSpeechAudio(mp3Buffer, filename = "test-audio.mp3") {
   console.log(
     `[POST] ${reserveUrl} (reserve slot for ${filename}, ${mp3Buffer.length} bytes)`,
   );
-  // 1. POST {} to reserve slot -> returns { path, url (presigned PUT), previewUrl }
+
   const reserveRes = await fetch(reserveUrl, {
     method: "POST",
     headers,
@@ -91,11 +84,11 @@ async function uploadSpeechAudio(mp3Buffer, filename = "test-audio.mp3") {
   console.log(` -> Slot path: ${slot.path}`);
   console.log(` -> PreviewUrl: ${slot.previewUrl}`);
   console.log(` -> Presigned PUT url: ${slot.url.slice(0, 120)}...`);
-  // 2. PUT mp3 bytes to presigned url
+
   const isWav =
     mp3Buffer.length > 4 && mp3Buffer[0] === 0x52 && mp3Buffer[1] === 0x49;
   const mime = isWav ? "audio/wav" : "audio/mpeg";
-  // ensure filename matches slot.path extension if needed, but keep mp3 for BET
+
   const putRes = await fetch(slot.url, {
     method: "PUT",
     headers: { "Content-Type": mime },
@@ -106,7 +99,7 @@ async function uploadSpeechAudio(mp3Buffer, filename = "test-audio.mp3") {
       `PUT to presigned url failed ${putRes.status} ${await putRes.text()}`,
     );
   console.log(` -> PUT OK to S3`);
-  // 3. Verify previewUrl has bytes (HEAD)
+
   for (let i = 0; i < 5; i++) {
     try {
       const head = await fetch(slot.previewUrl, { method: "HEAD" });
@@ -119,7 +112,7 @@ async function uploadSpeechAudio(mp3Buffer, filename = "test-audio.mp3") {
     } catch {}
     await sleep(800);
   }
-  return slot.previewUrl; // use previewUrl as spch_selected_answer (now actually has bytes, not empty)
+  return slot.previewUrl;
 }
 
 async function fetchRemoteMp3AsBuffer(remoteUrl) {
@@ -141,7 +134,7 @@ async function groqGenerateAnswer(questionHtml, extraContext = "") {
     prompt.toLowerCase().includes("imagine") ||
     prompt.toLowerCase().includes("introduce") ||
     prompt.length > 80;
-  // all Impromptu need long for L08-L15 stories — short gave 20%
+
   let system = isImpromptu
     ? "You are a BEGINNER CEFR English student. Answer the prompt directly in 6-8 simple sentences, 90-120 words, simple present, basic vocab, detailed. Do not say 'I am a beginner' — just answer. Cover every part."
     : "Repeat the sentence exactly as given, simple and clear.";
@@ -170,14 +163,13 @@ async function groqGenerateAnswer(questionHtml, extraContext = "") {
   const data = await res.json();
   let text = data.choices?.[0]?.message?.content?.trim();
   if (!text) text = data.choices?.[0]?.message?.reasoning?.trim();
-  // gpt-oss puts draft answer inside reasoning when content empty — extract last quoted sentences
+
   if (!text || text.startsWith("We need to")) {
     const reasoning = data.choices?.[0]?.message?.reasoning || text || "";
-    // extract last quoted answer: "My hometown is..."
+
     const match = reasoning.match(/"([^"]{20,200})"/);
     if (match) text = match[1];
     else {
-      // fallback: take last 2 sentences of reasoning
       const parts = reasoning.split(". ");
       text = parts
         .slice(-3)
@@ -231,7 +223,7 @@ async function submitAnswer(examId, questionUuid, audioUrl, type = "SPCH") {
     type,
     question_uuid: questionUuid,
     spch_selected_answer: audioUrl,
-    // keep other fields null as per your example
+
     mcq_selected_answer: null,
     pbq_selected_answer: null,
     amcq_selected_answer: null,
@@ -258,12 +250,9 @@ async function submitAnswer(examId, questionUuid, audioUrl, type = "SPCH") {
   return data;
 }
 
-// For non-SPCH questions, you can extend this:
-// function buildAnswerForType(q) { ... }
-
 async function processExam(examId) {
   const { questions } = await fetchQuestions(examId);
-  // collect Conceptual sentences for dynamic Impromptu context (if present)
+
   const conceptualTexts = questions
     .filter(
       (q) => q.spch?.answer_audio_path && q.category !== "Impromptu Speech",
@@ -288,12 +277,10 @@ async function processExam(examId) {
 
     let audioUrl;
 
-    // Option A: if question already has answer_audio_path and you want to reuse (fastest for analytics seeding)
     if (CONFIG.preferExistingAudio && q.spch?.answer_audio_path) {
       audioUrl = q.spch.answer_audio_path;
       console.log(` -> Using existing answer_audio_path: ${audioUrl}`);
     } else {
-      // Groq+Sarvam for >60%: Impromptu via LLM, Conceptual via direct TTS of question text
       let buffer;
       const useLLM = CONFIG.groqKey && CONFIG.sarvamKey;
       if (useLLM) {
@@ -302,7 +289,6 @@ async function processExam(examId) {
             !q.spch?.answer_audio_path &&
             (q.category === "Impromptu Speech" || q.question.length > 80);
           if (!isImpromptu && q.spch?.answer_audio_path) {
-            // Conceptual with qb mp3 -> use original mp3 directly (48% like L02), not Sarvam wav to avoid 500
             console.log(
               ` -> Conceptual with qb, fetching original mp3 for high score`,
             );
@@ -325,7 +311,7 @@ async function processExam(examId) {
             }
             console.log(` -> TTS text: "${ttsText.slice(0, 80)}..."`);
             buffer = await sarvamTTS(ttsText);
-            // convert wav -> mp3 for BET eval (expects mp3, not wav)
+
             const isWav = buffer[0] === 0x52 && buffer[1] === 0x49;
             if (isWav) {
               try {
@@ -395,8 +381,6 @@ async function processExam(examId) {
       try {
         audioUrl = await uploadSpeechAudio(buffer, `speech-${q.uuid}.mp3`);
       } catch (e) {
-        // If upload endpoint in dev returns previewUrl even with {} payload (your capture),
-        // fallback to reusing remote url directly so analytics still populates
         console.warn(
           ` -> Upload failed, falling back to direct URL: ${e.message}`,
         );
@@ -413,7 +397,6 @@ async function processExam(examId) {
 }
 
 async function submitExam(examId, lessonInstId) {
-  // POST .../bet-section-unit-lesson-insts/{lessonInstId}/bet-exams/{examId}:submit  payload {}
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-unit-lesson-insts/${lessonInstId}/bet-exams/${examId}:submit`;
   console.log(`[POST] ${url} :submit`);
   const res = await fetch(url, {
@@ -511,7 +494,7 @@ async function runSingleLesson(examId, lessonInstId) {
   );
   await sleep(CONFIG.scoreWaitMs);
   await submitExam(examId, lessonInstId);
-  // poll until percentage is a number (not null)
+
   for (let i = 0; i < 10; i++) {
     await sleep(3000);
     const lessons = await getLessonInsts();
@@ -537,21 +520,20 @@ async function main() {
     console.warn("WARN: Set TOKEN env var: TOKEN='Bearer ...' node script.js");
   }
 
-  // Manual mode: betExamIds provided (keep lessonMap for backward compat)
   if (CONFIG.betExamIds.length > 0) {
     console.log("Starting manual mode for exams:", CONFIG.betExamIds);
     const lessonMap = {
-      647889300: "7633969", // L02
-      648023850: "7633970", // L03
-      648066200: "7633971", // L04 Hometown 778977 (5 Qs)
-      648271350: "7633972", // L05
-      648305200: "7633973", // L10 (manual mismatch, keep)
-      648318600: "7633964", // L06 Past Achievements
-      648436100: "7633965", // L07 Future Goals
-      648490800: "7633966", // L08 Personal Anecdote retry
-      648576700: "7633963", // L09 Strengths retry
-      648664800: "7633973", // L10 Peer Introduction
-      648675550: "7633974", // L11 Storytelling
+      647889300: "7633969",
+      648023850: "7633970",
+      648066200: "7633971",
+      648271350: "7633972",
+      648305200: "7633973",
+      648318600: "7633964",
+      648436100: "7633965",
+      648490800: "7633966",
+      648576700: "7633963",
+      648664800: "7633973",
+      648675550: "7633974",
     };
     for (const id of CONFIG.betExamIds) {
       try {
@@ -572,7 +554,6 @@ async function main() {
     return;
   }
 
-  // Auto mode: discover IN_PROGRESS lessons and create exams sequentially
   if (!CONFIG.autoDiscover) {
     console.log("No betExamIds and autoDiscover false - nothing to do");
     return;
@@ -580,8 +561,7 @@ async function main() {
   console.log(`Starting AUTO mode (max ${CONFIG.maxAutoLessons} lessons)`);
   for (let i = 0; i < CONFIG.maxAutoLessons; i++) {
     const lessons = await getLessonInsts();
-    // find next lesson to seed: first IN_PROGRESS/NOT_STARTED with no exam_id (sequential unlock)
-    // L03 0% leaves L04 as NOT_STARTED, not IN_PROGRESS, so we handle both
+
     let target = null;
     for (const l of lessons) {
       const inst = (l.section_unit_lesson_insts || [])[0];

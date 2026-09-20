@@ -1,17 +1,16 @@
 import "dotenv/config";
-// Automate bet-exams completion for READING (DEV ONLY) — PBQ (passage -> Groq picks per MCQ)
-// Reading: PBQ (1 Q with 5x MCQ) vs Listening AMCQ / Speaking SPCH
+
 const CONFIG = {
   baseUrl: "https://corporate.bharatenglish.org",
   orgSlug: "lpu724598",
   userId: "12505798",
   userEmail: "12505798@lpu.in",
-  betExamIds: [], // e.g. ["649313300"] or [] for autoDiscover
+  betExamIds: [],
   authToken: process.env.TOKEN,
   cookie: "",
   autoDiscover: true,
   betSectionInstId: "177437",
-  betSectionUnitInstId: "941844", // 02 Following Return Policy Instructions (Reading)
+  betSectionUnitInstId: "941844",
   maxAutoLessons: 15,
   groqKey: process.env.GROQ_KEY,
   groqModel: "openai/gpt-oss-20b",
@@ -96,12 +95,11 @@ async function processExam(examId) {
       continue;
     }
     const passage = q.question;
-    // PBQ has 5x MCQ pbq_selected_answer
+
     const answers = [];
     for (const pbq of q.pbq || []) {
       let pick;
-      // use content API answer if available for 100%, else Groq
-      // For analytics we want Groq gpt-oss-20b
+
       try {
         pick = await groqPickPBQ(passage, pbq);
       } catch (e) {
@@ -117,10 +115,7 @@ async function processExam(examId) {
       );
       await sleep(400);
     }
-    // POST answers for PBQ: need to handle incremental pbq submission like your capture?
-    // BET expects incremental: send each pbq_selected_answer separately or together?
-    // Your manual did: POST {pbq_selected_answer: {answers:[{mcq:{selected_answer:2, question_uuid:d673...}}]}} per pbq batch
-    // We'll send all together as one POST for the PBQ uuid
+
     const payload = {
       type: "PBQ",
       question_uuid: q.uuid,
