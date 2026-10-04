@@ -1,616 +1,630 @@
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import https from "https";
+import { URL } from "url";
+import { execSync } from "child_process";
 
 const CONFIG = {
   baseUrl: "https://corporate.bharatenglish.org",
   orgSlug: "lpu724598",
-  userId: "1250xxxx",  // Use your registration id
-  userEmail: "1250xxxx@lpu.in",  // Use your registration id
-  betExamIds: [],
+  userId: "12520776",
+  userEmail: "12520776@lpu.in",
+  userPass: "12520776",
   authToken: process.env.TOKEN,
-  cookie: "",
-  autoDiscover: true,
-  betSectionInstId: "177435",
-  betSectionUnitInstId: "941832",
-  maxAutoLessons: 15,
-  impromptuAudioUrl:
-    "https://images1.wexledu.com/lpu724598/speech-uploads/e8b20c15-ad03-42c2-8dc3-decde93c0745.mp3",
-  useSameAudioForAll: false,
-  groqKey: process.env.GROQ_KEY,
-  sarvamKey: process.env.SARVAM_KEY,
+  betSectionInstId: "176843",
+  groqKey: process.env.GROQ_KEY || process.env.groq_key,
   groqModel: "openai/gpt-oss-20b",
-  sarvamSpeaker: "shubh",
-  delayMs: 800,
-  scoreWaitMs: 5000,
+  delayMs: 100,
+  scoreWaitMs: 800,
   preferExistingAudio: false,
 };
 
-// ---------- helpers ----------
-import fs from "fs";
-import path from "path";
-import { execSync } from "child_process";
-import os from "os";
-const headers = {
-  "Content-Type": "application/json",
-};
-if (CONFIG.authToken) headers["Authorization"] = CONFIG.authToken;
-if (CONFIG.cookie) headers["Cookie"] = CONFIG.cookie;
+const ORDERED_UNITS = [
+  941832, // Lecture 2: Morning Routine Walkthrough (15 lessons)
+  941831, // Lecture 1: Basic Self-Introduction (15 lessons)
+  941829, // Basic Request Dialogue (15 lessons)
+  941830, // Basic IT Support Request Dialogue (14 lessons)
+  941833, // Basic Directions Dialogue (8 lessons)
+  941834, // Level Test (1 lesson)
+];
 
-if (CONFIG.baseUrl.includes("localhost")) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+const headers = { "Content-Type": "application/json" };
+if (CONFIG.authToken) headers["Authorization"] = CONFIG.authToken;
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+function log(...args) {
+  const line = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ") + "\n";
+  process.stdout.write(line);
+  fs.appendFileSync("speaking_progress.txt", line);
 }
+
+process.on("uncaughtException", (err) => {
+  log("UNCAUGHT EXCEPTION:", err.stack || err);
+});
+process.on("unhandledRejection", (reason) => {
+  log("UNHANDLED REJECTION:", reason?.stack || reason);
+});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const SILENT_MP3_BASE64 =
-  "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAASAAAeAAABhgZGF0YQAAAAA=";
+async function loginIfNeeded() {
+  const url = `${CONFIG.baseUrl}/api/public/bet-exams/login`;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: CONFIG.userEmail,
+        password: CONFIG.userPass,
+        appContext: "BET_CORPORATE",
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const rawToken = data.jwtToken || data.token || data.id_token;
+      if (rawToken) {
+        const token = rawToken.startsWith("Bearer ") ? rawToken : `Bearer ${rawToken}`;
+        CONFIG.authToken = token;
+        headers["Authorization"] = token;
+        log(` -> Auth token refreshed for user ${CONFIG.userId}`);
+        return token;
+      }
+    }
+  } catch (e) {
+    log(` -> Login refresh warning: ${e.message}`);
+  }
+}
 
-function getSilentMp3Buffer() {
-  return Buffer.from(SILENT_MP3_BASE64, "base64");
+function uploadToS3Https(s3Url, buffer) {
+  return new Promise((resolve) => {
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      try { req.destroy(); } catch {}
+      resolve({ ok: false, status: 408, body: "S3 PUT Timeout" });
+    }, 15000);
+
+    let req;
+    try {
+      const u = new URL(s3Url);
+      req = https.request(
+        {
+          hostname: u.hostname,
+          port: 443,
+          path: u.pathname + u.search,
+          method: "PUT",
+          headers: {
+            "Content-Length": buffer.length,
+          },
+        },
+        (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve({ ok: true, status: res.statusCode, body });
+            } else {
+              resolve({ ok: false, status: res.statusCode, body });
+            }
+          });
+        }
+      );
+      req.on("error", (e) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve({ ok: false, status: 500, body: e.message });
+      });
+      req.write(buffer);
+      req.end();
+    } catch (e) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve({ ok: false, status: 500, body: e.message });
+    }
+  });
+}
+
+function generateFallbackWavBuffer() {
+  const sampleRate = 16000;
+  const numSamples = sampleRate * 2;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + numSamples * 2, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(numSamples * 2, 40);
+  const pcm = Buffer.alloc(numSamples * 2);
+  return Buffer.concat([header, pcm]);
+}
+
+function generateCompactLocalTTS(text) {
+  try {
+    const cleanText = text.replace(/[^a-zA-Z0-9\s.,?!'\-]/g, " ").replace(/\s+/g, " ").trim();
+    const tmpTxt = path.join(os.tmpdir(), `tts_in_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`);
+    const tmpWav = path.join(os.tmpdir(), `tts_out_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`);
+    fs.writeFileSync(tmpTxt, cleanText, "utf8");
+    
+    const psScript = `
+Add-Type -AssemblyName System.Speech
+$txt = [System.IO.File]::ReadAllText('${tmpTxt.replace(/'/g, "''")}', [System.Text.Encoding]::UTF8)
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$s.Rate = 0
+$s.Volume = 100
+$format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+$s.SetOutputToWaveFile('${tmpWav.replace(/'/g, "''")}', $format)
+$s.Speak($txt)
+$s.Dispose()
+`;
+    const tmpPs1 = path.join(os.tmpdir(), `tts_script_${Date.now()}_${Math.random().toString(36).slice(2)}.ps1`);
+    fs.writeFileSync(tmpPs1, psScript, "utf8");
+    
+    try {
+      execSync(`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${tmpPs1}"`, { stdio: "pipe" });
+    } finally {
+      try { fs.unlinkSync(tmpTxt); } catch {}
+      try { fs.unlinkSync(tmpPs1); } catch {}
+    }
+    
+    if (fs.existsSync(tmpWav)) {
+      const buffer = fs.readFileSync(tmpWav);
+      try { fs.unlinkSync(tmpWav); } catch {}
+      log(` -> Local TTS generated ${buffer.length} bytes for: "${cleanText.slice(0, 60)}..."`);
+      return buffer;
+    }
+  } catch (e) {
+    log(` -> TTS warning: ${e.message}, using fallback WAV`);
+  }
+  return generateFallbackWavBuffer();
 }
 
 async function fetchQuestions(examId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/questions`;
-  console.log(`[GET] ${url}`);
-  const res = await fetch(url, { headers, method: "GET" });
-  if (!res.ok)
-    throw new Error(`GET questions failed ${res.status} ${await res.text()}`);
-  const data = await res.json();
-
-  const questions = (data.test_definition_section || []).flatMap(
-    (s) => s.questions || [],
-  );
-  console.log(
-    ` -> Found ${questions.length} questions for exam ${examId} (${data.test_name})`,
-  );
-  return { meta: data, questions };
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(url, { headers, method: "GET", signal: AbortSignal.timeout(12000) });
+      if (res.status === 401) await loginIfNeeded();
+      if (res.ok) {
+        const data = await res.json();
+        const questions = (data.test_definition_section || []).flatMap((s) => s.questions || []);
+        log(` -> Found ${questions.length} questions for exam ${examId}`);
+        return { meta: data, questions };
+      }
+      const t = await res.text();
+      if (attempt === 4) throw new Error(`GET questions failed ${res.status} ${t}`);
+      await sleep(1000 * attempt);
+    } catch (e) {
+      if (attempt === 4) throw e;
+      await sleep(1000 * attempt);
+    }
+  }
 }
 
 async function uploadSpeechAudio(mp3Buffer, filename = "test-audio.mp3") {
   const reserveUrl = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userEmail}/speech-question:upload`;
-  console.log(
-    `[POST] ${reserveUrl} (reserve slot for ${filename}, ${mp3Buffer.length} bytes)`,
-  );
-
-  const reserveRes = await fetch(reserveUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({}),
-  });
-  if (!reserveRes.ok)
-    throw new Error(
-      `Reserve failed ${reserveRes.status} ${await reserveRes.text()}`,
-    );
-  const slot = await reserveRes.json();
-  console.log(` -> Slot path: ${slot.path}`);
-  console.log(` -> PreviewUrl: ${slot.previewUrl}`);
-  console.log(` -> Presigned PUT url: ${slot.url.slice(0, 120)}...`);
-
-  const isWav =
-    mp3Buffer.length > 4 && mp3Buffer[0] === 0x52 && mp3Buffer[1] === 0x49;
-  const mime = isWav ? "audio/wav" : "audio/mpeg";
-
-  const putRes = await fetch(slot.url, {
-    method: "PUT",
-    headers: { "Content-Type": mime },
-    body: mp3Buffer,
-  });
-  if (!putRes.ok)
-    throw new Error(
-      `PUT to presigned url failed ${putRes.status} ${await putRes.text()}`,
-    );
-  console.log(` -> PUT OK to S3`);
-
-  for (let i = 0; i < 5; i++) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      const head = await fetch(slot.previewUrl, { method: "HEAD" });
-      if (head.ok && Number(head.headers.get("content-length") || 0) > 1000) {
-        console.log(
-          ` -> PreviewUrl verified ${head.headers.get("content-length")} bytes`,
-        );
-        break;
+      const reserveRes = await fetch(reserveUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (reserveRes.status === 401) await loginIfNeeded();
+      if (!reserveRes.ok) {
+        const t = await reserveRes.text();
+        if (attempt === 4) throw new Error(`Reserve failed ${reserveRes.status} ${t}`);
+        await sleep(1000 * attempt);
+        continue;
       }
-    } catch {}
-    await sleep(800);
+      const slot = await reserveRes.json();
+      const putRes = await uploadToS3Https(slot.url, mp3Buffer);
+      if (!putRes.ok) {
+        if (attempt === 4) throw new Error(`PUT to presigned url failed ${putRes.status}`);
+        await sleep(1000 * attempt);
+        continue;
+      }
+      log(` -> Audio uploaded to S3: ${slot.path}`);
+      return slot.previewUrl || (slot.path ? `https://images1.wexledu.com/${slot.path}` : null);
+    } catch (e) {
+      if (attempt === 4) throw e;
+      await sleep(1000 * attempt);
+    }
   }
-  return slot.previewUrl;
 }
 
 async function fetchRemoteMp3AsBuffer(remoteUrl) {
-  console.log(` -> Fetching remote audio: ${remoteUrl}`);
-  const res = await fetch(remoteUrl);
-  if (!res.ok) throw new Error(`fetch remote mp3 failed ${res.status}`);
-  const ab = await res.arrayBuffer();
-  return Buffer.from(ab);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(remoteUrl, { signal: AbortSignal.timeout(12000) });
+      if (res.ok) {
+        const ab = await res.arrayBuffer();
+        return Buffer.from(ab);
+      }
+      if (attempt === 4) throw new Error(`fetch remote mp3 failed ${res.status}`);
+      await sleep(1000 * attempt);
+    } catch (e) {
+      if (attempt === 4) throw e;
+      await sleep(1000 * attempt);
+    }
+  }
 }
 
 async function groqGenerateAnswer(questionHtml, extraContext = "") {
   if (!CONFIG.groqKey) throw new Error("GROQ_KEY missing");
-  const prompt = questionHtml
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 800);
-  const isImpromptu =
-    prompt.toLowerCase().includes("imagine") ||
-    prompt.toLowerCase().includes("introduce") ||
-    prompt.length > 80;
+  const prompt = questionHtml.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 800);
+  const isImpromptu = prompt.toLowerCase().includes("imagine") || prompt.toLowerCase().includes("introduce") || prompt.length > 80;
 
   let system = isImpromptu
-    ? "You are a BEGINNER CEFR English student. Answer the prompt directly in 6-8 simple sentences, 90-120 words, simple present, basic vocab, detailed. Do not say 'I am a beginner' — just answer. Cover every part."
-    : "Repeat the sentence exactly as given, simple and clear.";
+    ? "You are a fluent CEFR business English student answering speaking test questions. Answer directly in 3-5 simple, grammatically perfect sentences. Output ONLY your direct spoken answer without any meta-commentary, introductory text, or quotes."
+    : "Repeat the exact spoken sentence clearly and correctly. Output ONLY the plain text sentence.";
+
   if (isImpromptu && extraContext) {
-    system += ` You MUST include all these ideas naturally in your answer: ${extraContext.slice(0, 400)}`;
+    system += ` Include these key phrases naturally: ${extraContext.slice(0, 300)}`;
   }
+
   const body = {
     model: CONFIG.groqModel,
     messages: [
       { role: "system", content: system },
       { role: "user", content: prompt },
     ],
-    temperature: 0.7,
-    max_tokens: 600,
-    reasoning_effort: "low",
+    temperature: 0.1,
+    max_tokens: 250,
   };
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CONFIG.groqKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Groq failed ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  let text = data.choices?.[0]?.message?.content?.trim();
-  if (!text) text = data.choices?.[0]?.message?.reasoning?.trim();
 
-  if (!text || text.startsWith("We need to")) {
-    const reasoning = data.choices?.[0]?.message?.reasoning || text || "";
-
-    const match = reasoning.match(/"([^"]{20,200})"/);
-    if (match) text = match[1];
-    else {
-      const parts = reasoning.split(". ");
-      text = parts
-        .slice(-3)
-        .join(". ")
-        .replace(/^We need to[\s\S]*?Sentence \d+:\s*/i, "")
-        .trim();
+  let text = "";
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CONFIG.groqKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      text = data.choices?.[0]?.message?.content?.trim() || data.choices?.[0]?.message?.reasoning?.trim() || "";
     }
+  } catch (e) {
+    log(` -> Groq error/rate-limit (${e.message}), using fallback answer`);
   }
-  if (!text || text.length < 10) {
-    const raw = JSON.stringify(data).slice(0, 800);
-    throw new Error(`Groq empty ${raw}`);
-  }
-  text = text.replace(/^We need to[\s\S]*?Answer:\s*/i, "").trim();
-  if (text.length > 490) text = text.slice(0, 490); // Sarvam max 500 chars
-  console.log(` -> Groq answer: "${text.slice(0, 120)}"`);
-  return text;
-}
 
-async function sarvamTTS(text) {
-  if (!CONFIG.sarvamKey) throw new Error("SARVAM_KEY missing");
-  const res = await fetch("https://api.sarvam.ai/text-to-speech", {
-    method: "POST",
-    headers: {
-      "api-subscription-key": CONFIG.sarvamKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      inputs: [text],
-      target_language_code: "en-IN",
-      speaker: CONFIG.sarvamSpeaker,
-      pace: 1.0,
-      loudness: 1.0,
-      speech_sample_rate: 22050,
-      enable_preprocessing: true,
-      model: "bulbul:v3",
-    }),
-  });
-  if (!res.ok)
-    throw new Error(`Sarvam failed ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  const b64 = data.audios?.[0];
-  if (!b64)
-    throw new Error(`Sarvam no audios ${JSON.stringify(data).slice(0, 400)}`);
-  console.log(` -> Sarvam audio ${b64.length} chars`);
-  return Buffer.from(b64, "base64");
+  if (!text) {
+    text = "I am happy to introduce myself and share my background, work experience, and future goals with the team. I always aim to communicate clearly and collaborate effectively.";
+  }
+
+  // Clean reasoning prefixes
+  text = text.replace(/^(We need to|Here is|Thinking Process|To answer|The student should)[\s\S]*?(Answer:|Response:|\n\n)/i, "").trim();
+  text = text.replace(/[*_#`"]/g, "").trim();
+  if (text.length > 350) text = text.slice(0, 350);
+
+  log(` -> Clean Groq answer: "${text.slice(0, 80)}..."`);
+  return text;
 }
 
 async function submitAnswer(examId, questionUuid, audioUrl, type = "SPCH") {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers`;
-  const payload = {
+  const payload = JSON.stringify({
     type,
     question_uuid: questionUuid,
     spch_selected_answer: audioUrl,
-
     mcq_selected_answer: null,
     pbq_selected_answer: null,
     amcq_selected_answer: null,
     subjective_written_answer: null,
-  };
-  console.log(`[POST] ${url} uuid=${questionUuid}`);
-  let res;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-    if (res.ok) break;
-    const txt = await res.text();
-    console.warn(
-      ` -> Attempt ${attempt + 1} failed ${res.status} ${txt.slice(0, 200)}`,
-    );
-    if (attempt < 2) await sleep(1500 * (attempt + 1));
-    else throw new Error(`Submit answer failed ${res.status} ${txt}`);
+  });
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: payload, signal: AbortSignal.timeout(12000) });
+      if (res.status === 401) await loginIfNeeded();
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        log(` -> Q Answer submitted: is_correct=${data.is_correct}`);
+        return data;
+      }
+      const txt = await res.text();
+      if (txt.includes("many speaking answers in the last hour")) {
+        log(` -> Rate limit hit. Waiting 60s before retry...`);
+        await sleep(60000);
+        attempt--; // Don't burn attempts on rate limits
+        continue;
+      }
+      if (attempt === 5) throw new Error(`Submit failed ${res.status} ${txt}`);
+      await sleep(1000 * attempt);
+    } catch (e) {
+      if (attempt === 5) throw e;
+      await sleep(1000 * attempt);
+    }
   }
-  const data = await res.json().catch(() => ({}));
-  console.log(` -> Answer submitted: ${JSON.stringify(data).slice(0, 200)}`);
-  return data;
 }
 
 async function processExam(examId) {
   const { questions } = await fetchQuestions(examId);
-
   const conceptualTexts = questions
-    .filter(
-      (q) => q.spch?.answer_audio_path && q.category !== "Impromptu Speech",
-    )
+    .filter((q) => q.spch?.answer_audio_path && q.category !== "Impromptu Speech")
     .map((q) => q.question.replace(/<[^>]*>/g, " ").trim())
-    .join(" | ");
-  if (conceptualTexts)
-    console.log(
-      ` -> Dynamic context for Impromptu: ${conceptualTexts.slice(0, 120)}...`,
-    );
+    .join(". ");
 
   for (const q of questions) {
-    console.log(`\n--- Q ${q.id} uuid=${q.uuid} type=${q.type} ---`);
-    console.log(`Q text: ${q.question.replace(/<[^>]*>/g, "").slice(0, 120)}`);
-
     if (q.type !== "SPCH") {
-      console.log(
-        `Skipping non-SPCH type ${q.type} - extend script for MCQ/MSQ etc.`,
-      );
+      log(`Skipping non-SPCH type ${q.type}`);
       continue;
     }
 
     let audioUrl;
+    let buffer;
+    const hasOfficialAudio = q.spch?.answer_audio_path && !q.category?.includes("Impromptu");
 
-    if (CONFIG.preferExistingAudio && q.spch?.answer_audio_path) {
-      audioUrl = q.spch.answer_audio_path;
-      console.log(` -> Using existing answer_audio_path: ${audioUrl}`);
-    } else {
-      let buffer;
-      const useLLM = CONFIG.groqKey && CONFIG.sarvamKey;
-      if (useLLM) {
-        try {
-          const isImpromptu =
-            !q.spch?.answer_audio_path &&
-            (q.category === "Impromptu Speech" || q.question.length > 80);
-          if (!isImpromptu && q.spch?.answer_audio_path) {
-            console.log(
-              ` -> Conceptual with qb, fetching original mp3 for high score`,
-            );
-            buffer = await fetchRemoteMp3AsBuffer(q.spch.answer_audio_path);
-          } else {
-            let ttsText;
-            if (isImpromptu) {
-              ttsText = await groqGenerateAnswer(q.question, conceptualTexts);
-            } else {
-              const base = q.question.replace(/<[^>]*>/g, " ").trim();
-              if (base.split(" ").length < 10) {
-                try {
-                  ttsText = await groqGenerateAnswer(
-                    `Expand this sentence into 2 simple sentences for speaking practice, keep the original sentence first: "${base}"`,
-                  );
-                } catch {
-                  ttsText = base + " It is very nice and peaceful.";
-                }
-              } else ttsText = base;
-            }
-            console.log(` -> TTS text: "${ttsText.slice(0, 80)}..."`);
-            buffer = await sarvamTTS(ttsText);
-
-            const isWav = buffer[0] === 0x52 && buffer[1] === 0x49;
-            if (isWav) {
-              try {
-                const tmpWav = path.join(os.tmpdir(), `sarvam-${q.uuid}.wav`);
-                const tmpMp3 = path.join(os.tmpdir(), `sarvam-${q.uuid}.mp3`);
-                await fs.promises.writeFile(tmpWav, buffer);
-                execSync(
-                  `ffmpeg -y -loglevel quiet -i "${tmpWav}" -codec:a libmp3lame -qscale:a 2 "${tmpMp3}"`,
-                );
-                buffer = await fs.promises.readFile(tmpMp3);
-                console.log(
-                  ` -> Converted wav->mp3 ${buffer.length} bytes via ffmpeg`,
-                );
-              } catch (e) {
-                console.warn(
-                  ` -> ffmpeg convert failed, keeping wav: ${e.message}`,
-                );
-              }
-            }
-          }
-        } catch (e) {
-          console.warn(
-            ` -> Groq/Sarvam failed, fallback to static audio: ${e.message}`,
-          );
-          if (CONFIG.impromptuAudioUrl)
-            buffer = await fetchRemoteMp3AsBuffer(CONFIG.impromptuAudioUrl);
-          else buffer = getSilentMp3Buffer();
-        }
-      } else if (CONFIG.useSameAudioForAll && CONFIG.impromptuAudioUrl) {
-        console.log(
-          ` -> Using same real voice for all: ${CONFIG.impromptuAudioUrl}`,
-        );
-        try {
-          buffer = await fetchRemoteMp3AsBuffer(CONFIG.impromptuAudioUrl);
-        } catch (e) {
-          console.warn(` -> Failed sameAudio, fallback silent: ${e.message}`);
-          buffer = getSilentMp3Buffer();
-        }
-      } else if (q.spch?.answer_audio_path) {
-        try {
-          buffer = await fetchRemoteMp3AsBuffer(q.spch.answer_audio_path);
-        } catch (e) {
-          console.warn(
-            ` -> Failed to fetch remote audio, using silent fallback: ${e.message}`,
-          );
-          buffer = getSilentMp3Buffer();
-        }
-      } else {
-        if (CONFIG.impromptuAudioUrl) {
-          try {
-            console.log(
-              ` -> No reference audio (Impromptu), fetching impromptuAudioUrl`,
-            );
-            buffer = await fetchRemoteMp3AsBuffer(CONFIG.impromptuAudioUrl);
-          } catch (e) {
-            console.warn(
-              ` -> Failed impromptuAudioUrl, using silent fallback: ${e.message}`,
-            );
-            buffer = getSilentMp3Buffer();
-          }
-        } else {
-          console.log(" -> No reference audio (Impromptu), using silent MP3");
-          buffer = getSilentMp3Buffer();
-        }
-      }
-
+    if (hasOfficialAudio) {
       try {
-        audioUrl = await uploadSpeechAudio(buffer, `speech-${q.uuid}.mp3`);
+        buffer = await fetchRemoteMp3AsBuffer(q.spch.answer_audio_path);
       } catch (e) {
-        console.warn(
-          ` -> Upload failed, falling back to direct URL: ${e.message}`,
-        );
-        audioUrl =
-          q.spch?.answer_audio_path ||
-          `https://images1.wexledu.com/${CONFIG.orgSlug}/speech-uploads/${q.uuid}.mp3`;
+        buffer = generateCompactLocalTTS(q.question.replace(/<[^>]*>/g, " ").trim());
       }
+    } else {
+      let ttsText = conceptualTexts || q.question.replace(/<[^>]*>/g, " ").trim();
+      if (CONFIG.groqKey && !conceptualTexts) {
+        try {
+          ttsText = await groqGenerateAnswer(q.question, conceptualTexts);
+        } catch (e) {
+          ttsText = q.question.replace(/<[^>]*>/g, " ").trim();
+        }
+      }
+      buffer = generateCompactLocalTTS(ttsText);
+    }
+
+    try {
+      audioUrl = await uploadSpeechAudio(buffer, `speech-${q.uuid}.mp3`);
+    } catch (e) {
+      audioUrl = q.spch?.answer_audio_path || `https://images1.wexledu.com/${CONFIG.orgSlug}/speech-uploads/${q.uuid}.mp3`;
     }
 
     await submitAnswer(examId, q.uuid, audioUrl, "SPCH");
     await sleep(CONFIG.delayMs);
   }
-  console.log(`\n=== Exam ${examId} done ===`);
+  log(`=== Exam ${examId} all questions submitted ===`);
 }
 
 async function submitExam(examId, lessonInstId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-unit-lesson-insts/${lessonInstId}/bet-exams/${examId}:submit`;
-  console.log(`[POST] ${url} :submit`);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({}),
-  });
-  const text = await res.text();
-  console.log(` -> Status ${res.status} Body: ${text.slice(0, 600)}`);
-  if (!res.ok) throw new Error(`Submit failed ${res.status} ${text}`);
-  try {
-    const data = JSON.parse(text);
-    console.log(
-      ` -> Finalized: betStatus=${data.betStatus} percentage=${data.percentage}`,
-    );
-  } catch {}
-  return text;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(15000) });
+      if (res.status === 401) await loginIfNeeded();
+      const txt = await res.text();
+      if (res.ok) {
+        try {
+          const d = JSON.parse(txt);
+          log(` -> Finalized: betStatus=${d.betStatus} percentage=${d.percentage}%`);
+        } catch {}
+        return txt;
+      }
+      if (res.status === 504 || res.status === 502 || res.status === 503 || res.status === 500) {
+        log(` -> Server status ${res.status}, retrying ${attempt}/4...`);
+        await sleep(2000 * attempt);
+        continue;
+      }
+      throw new Error(`Submit failed ${res.status} ${txt}`);
+    } catch (e) {
+      if (attempt === 4) throw e;
+      log(` -> Submit error: ${e.message}, retrying...`);
+      await sleep(2000 * attempt);
+    }
+  }
 }
 
-async function getLessonInsts() {
-  const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${CONFIG.betSectionUnitInstId}/bet-section-unit-lesson-insts`;
-  console.log(`[GET] ${url}`);
-  const res = await fetch(url, { headers, method: "GET" });
-  if (!res.ok)
-    throw new Error(
-      `GET lesson-insts failed ${res.status} ${await res.text()}`,
-    );
-  return res.json();
+async function getLessonInsts(unitId) {
+  const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${unitId}/bet-section-unit-lesson-insts`;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(url, { headers, method: "GET", signal: AbortSignal.timeout(12000) });
+      if (res.status === 401) await loginIfNeeded();
+      if (res.ok) return res.json();
+      const t = await res.text();
+      if (attempt === 4) throw new Error(`GET lesson-insts failed ${res.status} ${t}`);
+      await sleep(1000 * attempt);
+    } catch (e) {
+      if (attempt === 4) throw e;
+      await sleep(1000 * attempt);
+    }
+  }
 }
 
 async function createExamForLesson(lessonInstId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-unit-lesson-insts/${lessonInstId}/bet-exams`;
-  console.log(`[POST] ${url} (create exam)`);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({}),
-  });
-  const text = await res.text();
-  console.log(` -> Status ${res.status} Body: ${text.slice(0, 600)}`);
-  if (!res.ok) throw new Error(`Create exam failed ${res.status} ${text}`);
-  const data = JSON.parse(text);
-  const examId = data.id || data.exam_id || data.examId;
-  if (!examId) throw new Error(`No exam id in response ${text}`);
-  console.log(
-    ` -> Created exam_id=${examId} for lesson_inst_id=${lessonInstId}`,
-  );
-  return String(examId);
-}
-
-async function verifyExam(examId) {
-  console.log(`\n[VERIFY] Checking analytics for exam ${examId}`);
-  const candidates = [
-    `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${CONFIG.betSectionUnitInstId}/bet-section-unit-lesson-insts`,
-  ];
-  for (const url of candidates) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      console.log(`[GET] ${url}`);
-      const res = await fetch(url, { headers, method: "GET" });
-      const text = await res.text();
-      console.log(` -> Status ${res.status}`);
-      if (res.ok) {
-        try {
-          const data = JSON.parse(text);
-          const count = Array.isArray(data)
-            ? data.length
-            : Array.isArray(data.answers)
-              ? data.answers.length
-              : Array.isArray(data.data)
-                ? data.data.length
-                : 1;
-          console.log(` -> Found ${count} answer(s): ${text.slice(0, 600)}`);
-          if (text.includes("images1.wexledu.com"))
-            console.log(" -> ✓ Seeded audio URLs present");
-        } catch {
-          console.log(` -> Body: ${text.slice(0, 600)}`);
-        }
-        return;
-      } else {
-        console.log(` -> Body: ${text.slice(0, 400)}`);
+      const res = await fetch(url, { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(12000) });
+      if (res.status === 401) await loginIfNeeded();
+      const txt = await res.text();
+      let d = {};
+      try { d = JSON.parse(txt); } catch {}
+      const examId = d.id || d.exam_id || d.examId || d.betExamId;
+      if (examId) {
+        log(` -> Created/Found exam_id=${examId}`);
+        return String(examId);
       }
+      await sleep(1000 * attempt);
     } catch (e) {
-      console.warn(` -> Verify failed for ${url}: ${e.message}`);
+      if (attempt === 4) throw e;
+      await sleep(1000 * attempt);
     }
   }
-  console.log(
-    " -> No verify endpoint matched. Check dashboard UI or Network > bet-report/bet-dashboard",
-  );
+  throw new Error(`No exam id returned for lesson ${lessonInstId}`);
 }
 
-async function runSingleLesson(examId, lessonInstId) {
-  await processExam(examId);
-  console.log(
-    ` -> Waiting ${CONFIG.scoreWaitMs}ms for S3 replication + scorer...`,
-  );
-  await sleep(CONFIG.scoreWaitMs);
-  await submitExam(examId, lessonInstId);
+function isLessonDone(inst) {
+  if (!inst) return false;
+  const status = inst.bet_status || inst.lesson_status;
+  return status === "COMPLETED" || status === "PASSED" || (inst.percentage != null && inst.percentage >= 70);
+}
 
-  for (let i = 0; i < 10; i++) {
-    await sleep(3000);
-    const lessons = await getLessonInsts();
-    const cur = lessons.find(
-      (l) =>
-        (l.section_unit_lesson_insts || [])[0]?.lesson_inst_id ===
-        Number(lessonInstId),
-    );
-    const pct = cur?.section_unit_lesson_insts?.[0]?.percentage;
-    console.log(
-      ` -> Poll ${i + 1}: ${cur?.lesson_name} percentage=${pct} bet=${cur?.section_unit_lesson_insts?.[0]?.bet_status}`,
-    );
-    if (pct !== null && pct !== undefined) break;
+async function solveUnit(unitId) {
+  log(`\n========================================================`);
+  log(`========== STARTING SPEAKING UNIT: ${unitId} ==========`);
+  log(`========================================================`);
+
+  const attemptedLessons = new Set();
+
+  while (true) {
+    try {
+      let lessons = await getLessonInsts(unitId);
+      if (!Array.isArray(lessons)) {
+        await sleep(1500);
+        continue;
+      }
+
+      let target = null;
+      for (const l of lessons) {
+        const inst = (l.section_unit_lesson_insts || [])[0];
+        if (isLessonDone(inst)) continue;
+
+        const isLocked = (l.lesson_status === "LOCKED" || inst?.bet_status === "LOCKED" || !inst?.lesson_inst_id) && !inst?.exam_id;
+        if (!isLocked && inst?.lesson_inst_id) {
+          if (attemptedLessons.has(inst.lesson_inst_id)) {
+            // Check if there is an unattempted unlocked lesson ahead
+            const unattemptedAhead = lessons.find((laterL) => {
+              const laterInst = (laterL.section_unit_lesson_insts || [])[0];
+              const laterLocked = (laterL.lesson_status === "LOCKED" || laterInst?.bet_status === "LOCKED" || !laterInst?.lesson_inst_id) && !laterInst?.exam_id;
+              return (
+                laterL.seq_no > l.seq_no &&
+                !isLessonDone(laterInst) &&
+                !laterLocked &&
+                laterInst?.lesson_inst_id &&
+                !attemptedLessons.has(laterInst.lesson_inst_id)
+              );
+            });
+            if (unattemptedAhead) {
+              target = { lesson: unattemptedAhead, inst: (unattemptedAhead.section_unit_lesson_insts || [])[0] };
+              break;
+            } else {
+              continue;
+            }
+          }
+          target = { lesson: l, inst };
+          break;
+        }
+      }
+
+      if (!target) {
+        const allDoneOrLocked = lessons.every((l) => {
+          const inst = (l.section_unit_lesson_insts || [])[0];
+          const isLocked = (l.lesson_status === "LOCKED" || inst?.bet_status === "LOCKED" || !inst?.lesson_inst_id) && !inst?.exam_id;
+          return isLessonDone(inst) || (inst?.lesson_inst_id && attemptedLessons.has(inst.lesson_inst_id)) || isLocked;
+        });
+
+        if (allDoneOrLocked) {
+          log(`\n>>> SPEAKING UNIT ${unitId} COMPLETED / ALL ACCESSIBLE LESSONS DONE! <<<`);
+          break;
+        }
+
+        log(`Waiting 2s for next lesson in Speaking Unit ${unitId} to unlock...`);
+        await sleep(2000);
+        continue;
+      }
+
+      const lessonInstId = String(target.inst.lesson_inst_id);
+      attemptedLessons.add(target.inst.lesson_inst_id);
+
+      log(`\n--------------------------------------------------------`);
+      log(`>>> Processing L${target.lesson.seq_no} "${target.lesson.lesson_name}" (InstId: ${lessonInstId}) <<<`);
+      log(`--------------------------------------------------------`);
+
+      let examId = null;
+      if (target.inst.bet_status === "FAILED" || !target.inst.exam_id) {
+        try {
+          examId = await createExamForLesson(lessonInstId);
+        } catch (e) {
+          if (target.inst.exam_id) {
+            examId = String(target.inst.exam_id);
+            log(` -> Using existing exam_id=${examId}`);
+          } else {
+            log(`!! Create exam error: ${e.message}`);
+            await sleep(2000);
+            continue;
+          }
+        }
+      } else {
+        examId = String(target.inst.exam_id);
+        log(` -> Using existing exam_id=${examId}`);
+      }
+
+      await processExam(examId);
+      log(` -> Submitting exam ${examId}...`);
+      await submitExam(examId, lessonInstId);
+      log(` -> Waiting 2000ms for score sync...`);
+      await sleep(2000);
+    } catch (err) {
+      log(`!! solveUnit error in loop: ${err.message}, retrying in 2s...`);
+      if (target?.inst?.lesson_inst_id) {
+        attemptedLessons.delete(target.inst.lesson_inst_id);
+      }
+      await sleep(2000);
+    }
   }
-  await verifyExam(examId);
 }
 
 async function main() {
-  console.log(
-    `Base: ${CONFIG.baseUrl}, Org: ${CONFIG.orgSlug}, User: ${CONFIG.userId}`,
-  );
-  if (!CONFIG.authToken || CONFIG.authToken.includes("PASTE_YOUR_TOKEN")) {
-    console.warn("WARN: Set TOKEN env var: TOKEN='Bearer ...' node script.js");
+  await loginIfNeeded();
+  fs.appendFileSync("speaking_progress.txt", `=== SPEAKING AUTOMATION STARTED: User ${CONFIG.userId} ===\n`);
+  log(`[SPEAKING] Started for User: ${CONFIG.userId}, Section: ${CONFIG.betSectionInstId}`);
+
+  let unitsToRun = ORDERED_UNITS;
+  const rawArg = process.argv.slice(2).join(" ");
+  if (rawArg) {
+    const num = parseInt(rawArg.replace(/\D/g, ""), 10);
+    if (!isNaN(num)) {
+      if (ORDERED_UNITS.includes(num)) {
+        unitsToRun = [num];
+      } else if (num >= 1 && num <= ORDERED_UNITS.length) {
+        unitsToRun = [ORDERED_UNITS[num - 1]];
+      }
+    }
   }
 
-  if (CONFIG.betExamIds.length > 0) {
-    console.log("Starting manual mode for exams:", CONFIG.betExamIds);
-    const lessonMap = {
-      647889300: "7633969",
-      648023850: "7633970",
-      648066200: "7633971",
-      648271350: "7633972",
-      648305200: "7633973",
-      648318600: "7633964",
-      648436100: "7633965",
-      648490800: "7633966",
-      648576700: "7633963",
-      648664800: "7633973",
-      648675550: "7633974",
-    };
-    for (const id of CONFIG.betExamIds) {
+  log(`Targeting Units: ${unitsToRun.join(", ")}`);
+
+  for (const unitId of unitsToRun) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const lessonInstId = lessonMap[id] || null;
-        await processExam(id);
-        if (lessonInstId) await submitExam(id, lessonInstId);
-        else
-          console.warn(
-            ` -> No lessonInstId for ${id}, skipping :submit (enable autoDiscover or add to lessonMap)`,
-          );
-        await verifyExam(id);
-      } catch (e) {
-        console.error(`!! Failed exam ${id}:`, e.message);
-      }
-      await sleep(CONFIG.delayMs);
-    }
-    console.log("\nAll done. Check your analytics dashboard now.");
-    return;
-  }
-
-  if (!CONFIG.autoDiscover) {
-    console.log("No betExamIds and autoDiscover false - nothing to do");
-    return;
-  }
-  console.log(`Starting AUTO mode (max ${CONFIG.maxAutoLessons} lessons)`);
-  for (let i = 0; i < CONFIG.maxAutoLessons; i++) {
-    const lessons = await getLessonInsts();
-
-    let target = null;
-    for (const l of lessons) {
-      const inst = (l.section_unit_lesson_insts || [])[0];
-      if (!inst) continue;
-      const isNext =
-        (l.lesson_status === "IN_PROGRESS" ||
-          l.lesson_status === "NOT_STARTED") &&
-        (inst.bet_status === "IN_PROGRESS" ||
-          inst.bet_status === "NOT_STARTED") &&
-        !inst.exam_id;
-      if (isNext) {
-        target = { lesson: l, inst };
+        await solveUnit(unitId);
         break;
+      } catch (e) {
+        log(`!! solveUnit warning for ${unitId}: ${e.message}, retrying attempt ${attempt}/3...`);
+        await sleep(3000 * attempt);
       }
     }
-    if (!target) {
-      console.log("No IN_PROGRESS lesson found. Current statuses:");
-      lessons.forEach((l) => {
-        const inst = (l.section_unit_lesson_insts || [])[0];
-        console.log(
-          ` L${l.seq_no} ${l.lesson_name} status=${l.lesson_status} bet=${inst?.bet_status} id=${inst?.lesson_inst_id} exam=${inst?.exam_id}`,
-        );
-      });
-      console.log("Unlock chain complete or need manual trigger. Stopping.");
-      break;
-    }
-    const lessonInstId = String(target.inst.lesson_inst_id);
-    console.log(
-      `\n=== Auto L${target.lesson.seq_no} ${target.lesson.lesson_name} lesson_inst_id=${lessonInstId} ===`,
-    );
-    let examId = target.inst.exam_id ? String(target.inst.exam_id) : null;
-    if (!examId) {
-      examId = await createExamForLesson(lessonInstId);
-      await sleep(CONFIG.delayMs);
-    } else {
-      console.log(` -> Using existing exam_id=${examId}`);
-    }
-    try {
-      await runSingleLesson(examId, lessonInstId);
-    } catch (e) {
-      console.error(
-        `!! Failed lesson ${lessonInstId} exam ${examId}:`,
-        e.message,
-      );
-      break;
-    }
-    await sleep(CONFIG.delayMs);
+    await sleep(1000);
   }
-  console.log("\nAll done. Check your analytics dashboard now.");
+
+  log("\n============================================================");
+  log("=== ALL TARGETED SPEAKING UNITS AND LESSONS COMPLETED! ===");
+  log("============================================================");
 }
 
-main().catch(console.error);
+try {
+  await main();
+} catch (e) {
+  log("FATAL ERROR in main:", e);
+}

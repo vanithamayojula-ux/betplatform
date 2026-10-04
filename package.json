@@ -1,5 +1,15 @@
 {
+  "name": "betplatform",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "reading": "node run_reading_12517515.js",
+    "listening": "node listening_script.js",
+    "speaking": "node solve_speaking_continuous.js",
+    "writing": "node run_writing_12517515.js",
+    "writting": "node run_writing_12517515.js"
+  },
   "dependencies": {
-    "dotenv": "^18.0.1"
+    "dotenv": "^18.0.3"
   }
 }

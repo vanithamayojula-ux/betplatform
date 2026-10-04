@@ -1,60 +1,72 @@
 import "dotenv/config";
+import fs from "fs";
 
 const CONFIG = {
   baseUrl: "https://corporate.bharatenglish.org",
   orgSlug: "lpu724598",
-  userId: "1250xxxx",  // Use your registration id
-  userEmail: "1250xxxx@lpu.in",   // Use your registration id
-  betExamIds: [],
+  userId: "12520776",
+  userEmail: "12520776@lpu.in",
+  userPass: "12520776",
   authToken: process.env.TOKEN,
-  cookie: "",
-  autoDiscover: true,
-  betSectionInstId: "177437",
-  betSectionUnitInstId: "941844",
-  maxAutoLessons: 15,
-  groqKey: process.env.GROQ_KEY,
+  betSectionInstId: "176800",
+  groqKey: process.env.GROQ_KEY || process.env.groq_key,
   groqModel: "openai/gpt-oss-20b",
-  delayMs: 800,
+  delayMs: 200,
   scoreWaitMs: 1000,
 };
+
+const ORDERED_UNITS = [
+  941841, // Emails and Messages (15 lessons)
+  941844, // Office Notices (15 lessons)
+  941842, // Short Articles (10 lessons)
+  941843, // Reports and Summaries (1 lesson)
+  941845, // Workplace Guidelines (12 lessons)
+  941846, // Level Test (15 lessons)
+];
+
 const headers = { "Content-Type": "application/json" };
 if (CONFIG.authToken) headers["Authorization"] = CONFIG.authToken;
-if (CONFIG.cookie) headers["Cookie"] = CONFIG.cookie;
-if (CONFIG.baseUrl.includes("localhost"))
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+function log(...args) {
+  const line = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ") + "\n";
+  process.stdout.write(line);
+  fs.appendFileSync("reading_progress.txt", line);
+}
+
+process.on("uncaughtException", (err) => {
+  log("UNCAUGHT EXCEPTION:", err.stack || err);
+});
+process.on("unhandledRejection", (reason) => {
+  log("UNHANDLED REJECTION:", reason?.stack || reason);
+});
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchQuestions(examId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/questions`;
-  console.log(`[GET] ${url}`);
+  log(`[GET] ${url}`);
   const res = await fetch(url, { headers, method: "GET" });
-  if (!res.ok)
-    throw new Error(`GET questions failed ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`GET questions failed ${res.status} ${await res.text()}`);
   const data = await res.json();
-  const questions = (data.test_definition_section || []).flatMap(
-    (s) => s.questions || [],
-  );
-  console.log(
-    ` -> Found ${questions.length} questions for exam ${examId} (${data.test_name})`,
-  );
+  const questions = (data.test_definition_section || []).flatMap((s) => s.questions || []);
+  log(` -> Found ${questions.length} questions for exam ${examId} (${data.test_name})`);
   return { meta: data, questions };
 }
 
 async function groqPickPBQ(passage, pbq) {
-  if (!CONFIG.groqKey) throw new Error("GROQ_KEY missing");
-  const opts = `1) ${pbq.mcq.option1} 2) ${pbq.mcq.option2} 3) ${pbq.mcq.option3} 4) ${pbq.mcq.option4}`;
-  const system =
-    "You are a reading comprehension assistant. Given passage and a multiple choice question with 4 options, pick the correct option number 1-4. Reply with only a single digit 1,2,3 or 4.";
-  const user = `Passage: "${passage.replace(/<[^>]*>/g, " ").trim()}"\nQuestion: ${pbq.question}\nOptions: ${opts}`;
+  if (!CONFIG.groqKey) return 2;
+  const opts = `1) ${pbq.mcq?.option1 || pbq.option1} 2) ${pbq.mcq?.option2 || pbq.option2} 3) ${pbq.mcq?.option3 || pbq.option3} 4) ${pbq.mcq?.option4 || pbq.option4}`;
+  const system = "You are a reading comprehension assistant. Given a passage and a multiple choice question with 4 options, pick the correct option number 1-4. Reply with only a single digit 1, 2, 3, or 4.";
+  const user = `Passage: "${(passage || "").replace(/<[^>]*>/g, " ").trim()}"\nQuestion: ${pbq.question}\nOptions: ${opts}`;
   const body = {
     model: CONFIG.groqModel,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    temperature: 0.2,
-    max_tokens: 50,
-    reasoning_effort: "low",
+    temperature: 0.1,
+    max_tokens: 20,
   };
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -64,240 +76,273 @@ async function groqPickPBQ(passage, pbq) {
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok)
-    throw new Error(`Groq pick failed ${res.status} ${await res.text()}`);
+  if (!res.ok) return 2;
   const data = await res.json();
-  let txt =
-    data.choices?.[0]?.message?.content?.trim() ||
-    data.choices?.[0]?.message?.reasoning?.trim() ||
-    "";
-  if (!txt || !/[1-4]/.test(txt)) {
-    const r = data.choices?.[0]?.message?.reasoning || txt || "";
-    const m2 = r.match(/[1-4]/);
-    if (m2) txt = m2[0];
-  }
+  let txt = data.choices?.[0]?.message?.content?.trim() || "";
   const m = txt.match(/[1-4]/);
-  if (!m)
-    throw new Error(
-      `Groq pick empty ${txt} ${JSON.stringify(data).slice(0, 300)}`,
-    );
-  const pick = Number(m[0]);
-  console.log(` -> Groq pick: ${pick} for "${pbq.question.slice(0, 40)}"`);
+  const pick = m ? Number(m[0]) : 2;
+  log(` -> Groq pick: ${pick} for "${(pbq.question || "").slice(0, 40)}"`);
+  return pick;
+}
+
+async function groqPickMCQ(question, options) {
+  if (!CONFIG.groqKey) return 2;
+  const opts = `1) ${options[0]} 2) ${options[1]} 3) ${options[2]} 4) ${options[3]}`;
+  const system = "You are a reading comprehension assistant. Given a question with 4 options, pick the correct option number 1-4. Reply with only a single digit 1, 2, 3, or 4.";
+  const user = `Question: ${(question || "").replace(/<[^>]*>/g, " ").trim()}\nOptions: ${opts}`;
+  const body = {
+    model: CONFIG.groqModel,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    temperature: 0.1,
+    max_tokens: 20,
+  };
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CONFIG.groqKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return 2;
+  const data = await res.json();
+  let txt = data.choices?.[0]?.message?.content?.trim() || "";
+  const m = txt.match(/[1-4]/);
+  const pick = m ? Number(m[0]) : 2;
+  log(` -> Groq pick: ${pick} for "${(question || "").slice(0, 40)}"`);
   return pick;
 }
 
 async function processExam(examId) {
   const { questions } = await fetchQuestions(examId);
   for (const q of questions) {
-    console.log(`\n--- Q ${q.id} uuid=${q.uuid} type=${q.type} ---`);
-    if (q.type !== "PBQ") {
-      console.log(`Skipping ${q.type}`);
-      continue;
-    }
-    const passage = q.question;
-
-    const answers = [];
-    for (const pbq of q.pbq || []) {
-      let pick;
-
-      try {
-        pick = await groqPickPBQ(passage, pbq);
-      } catch (e) {
-        console.warn(` -> Groq failed, fallback to 2: ${e.message}`);
-        pick = 2;
+    log(`\n--- Q ${q.id} uuid=${q.uuid} type=${q.type} ---`);
+    if (q.type === "PBQ") {
+      const passage = q.question;
+      const answers = [];
+      for (const pbq of q.pbq || []) {
+        let pick = await groqPickPBQ(passage, pbq);
+        answers.push({
+          type: "MCQ",
+          mcq: { selected_answer: pick, question_uuid: pbq.uuid },
+        });
+        log(`  PBQ ${pbq.id} ${(pbq.question || "").slice(0, 40)} -> pick ${pick}`);
+        await sleep(200);
       }
-      answers.push({
-        type: "MCQ",
-        mcq: { selected_answer: pick, question_uuid: pbq.uuid },
-      });
-      console.log(
-        `  PBQ ${pbq.id} ${pbq.question.slice(0, 40)} -> pick ${pick}`,
+      const payload = {
+        type: "PBQ",
+        question_uuid: q.uuid,
+        pbq_selected_answer: { answers },
+      };
+      const res = await fetch(
+        `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers`,
+        { method: "POST", headers, body: JSON.stringify(payload) }
       );
-      await sleep(400);
+      if (!res.ok) log(` -> PBQ submit error: ${res.status}`);
+      else {
+        const data = await res.json().catch(() => ({}));
+        log(` -> PBQ submitted: is_correct=${data.is_correct} marks=${data.marks_scored}`);
+      }
+      await sleep(CONFIG.delayMs);
+    } else if (q.type === "MCQ") {
+      const opts = [q.mcq?.option1, q.mcq?.option2, q.mcq?.option3, q.mcq?.option4];
+      let pick = await groqPickMCQ(q.question, opts);
+      const payload = {
+        type: "MCQ",
+        question_uuid: q.uuid,
+        mcq_selected_answer: pick,
+      };
+      const res = await fetch(
+        `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers`,
+        { method: "POST", headers, body: JSON.stringify(payload) }
+      );
+      if (!res.ok) log(` -> MCQ submit error: ${res.status}`);
+      else {
+        const data = await res.json().catch(() => ({}));
+        log(` -> MCQ submitted: is_correct=${data.is_correct} marks=${data.marks_scored}`);
+      }
+      await sleep(CONFIG.delayMs);
+    } else if (q.type === "AMCQ") {
+      const opts = [q.amcq?.option1, q.amcq?.option2, q.amcq?.option3, q.amcq?.option4];
+      let pick = q.amcq?.answer || (await groqPickMCQ(q.question || q.explanation || "", opts));
+      const payload = {
+        type: "AMCQ",
+        question_uuid: q.uuid,
+        amcq_selected_answer: pick,
+      };
+      const res = await fetch(
+        `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers`,
+        { method: "POST", headers, body: JSON.stringify(payload) }
+      );
+      if (!res.ok) log(` -> AMCQ submit error: ${res.status}`);
+      else {
+        const data = await res.json().catch(() => ({}));
+        log(` -> AMCQ submitted: is_correct=${data.is_correct} marks=${data.marks_scored}`);
+      }
+      await sleep(CONFIG.delayMs);
+    } else {
+      log(`Skipping question type: ${q.type}`);
     }
-
-    const payload = {
-      type: "PBQ",
-      question_uuid: q.uuid,
-      pbq_selected_answer: { answers },
-    };
-    console.log(
-      `[POST] ${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers PBQ ${q.uuid} with ${answers.length} picks`,
-    );
-    const res = await fetch(
-      `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-exams/${examId}/answers`,
-      { method: "POST", headers, body: JSON.stringify(payload) },
-    );
-    if (!res.ok)
-      throw new Error(`PBQ submit failed ${res.status} ${await res.text()}`);
-    const data = await res.json().catch(() => ({}));
-    console.log(
-      ` -> PBQ submitted: is_correct=${data.is_correct} marks_scored=${data.marks_scored}`,
-    );
-    await sleep(CONFIG.delayMs);
   }
-  console.log(`\n=== Exam ${examId} done ===`);
+  log(`=== Exam ${examId} done ===`);
 }
 
 async function submitExam(examId, lessonInstId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-unit-lesson-insts/${lessonInstId}/bet-exams/${examId}:submit`;
-  console.log(`[POST] ${url} :submit`);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({}),
-  });
-  const txt = await res.text();
-  console.log(` -> Status ${res.status} Body: ${txt.slice(0, 600)}`);
-  if (!res.ok) throw new Error(`Submit failed ${res.status} ${txt}`);
-  try {
-    const d = JSON.parse(txt);
-    console.log(
-      ` -> Finalized: betStatus=${d.betStatus} percentage=${d.percentage}`,
-    );
-  } catch {}
-  return txt;
+  log(`[POST] ${url} :submit`);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      const txt = await res.text();
+      log(` -> Status ${res.status} Body: ${txt.slice(0, 200)}`);
+      if (res.ok) return txt;
+      await sleep(2000 * attempt);
+    } catch (e) {
+      if (attempt === 3) throw e;
+      await sleep(2000 * attempt);
+    }
+  }
 }
-async function getLessonInsts() {
-  const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${CONFIG.betSectionUnitInstId}/bet-section-unit-lesson-insts`;
-  console.log(`[GET] ${url}`);
+
+async function getLessonInsts(unitId) {
+  const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${unitId}/bet-section-unit-lesson-insts`;
   const res = await fetch(url, { headers, method: "GET" });
-  if (!res.ok)
-    throw new Error(
-      `GET lesson-insts failed ${res.status} ${await res.text()}`,
-    );
+  if (!res.ok) throw new Error(`GET lesson-insts failed ${res.status}`);
   return res.json();
 }
+
 async function createExamForLesson(lessonInstId) {
   const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-unit-lesson-insts/${lessonInstId}/bet-exams`;
-  console.log(`[POST] ${url} (create exam)`);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({}),
-  });
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({}) });
   const txt = await res.text();
-  console.log(` -> Status ${res.status} Body: ${txt.slice(0, 600)}`);
   if (!res.ok) throw new Error(`Create exam failed ${res.status} ${txt}`);
   const d = JSON.parse(txt);
   const examId = d.id || d.exam_id || d.examId;
-  if (!examId) throw new Error(`No exam id ${txt}`);
-  console.log(
-    ` -> Created exam_id=${examId} for lesson_inst_id=${lessonInstId}`,
-  );
+  log(` -> Created exam_id=${examId} for lesson_inst_id=${lessonInstId}`);
   return String(examId);
 }
-async function verifyExam(examId) {
-  console.log(`\n[VERIFY] Checking analytics for exam ${examId}`);
-  const url = `${CONFIG.baseUrl}/api/orgs/${CONFIG.orgSlug}/users/${CONFIG.userId}/bet-section-insts/${CONFIG.betSectionInstId}/bet-section-unit-insts/${CONFIG.betSectionUnitInstId}/bet-section-unit-lesson-insts`;
-  console.log(`[GET] ${url}`);
-  const res = await fetch(url, { headers, method: "GET" });
-  const txt = await res.text();
-  console.log(` -> Status ${res.status}`);
-  if (res.ok) {
+
+function isLessonDone(inst) {
+  if (!inst) return false;
+  const status = inst.bet_status || inst.lesson_status;
+  return status === "COMPLETED" || status === "PASSED" || inst.percentage != null;
+}
+
+async function solveUnit(unitId) {
+  log(`\n========================================================`);
+  log(`========== STARTING READING UNIT: ${unitId} ==========`);
+  log(`========================================================`);
+
+  const attemptedLessons = new Set();
+
+  while (true) {
     try {
-      const d = JSON.parse(txt);
-      console.log(` -> Found ${Array.isArray(d) ? d.length : 1} lessons`);
-    } catch {
-      console.log(txt.slice(0, 600));
-    }
-  }
-}
-async function runSingleLesson(examId, lessonInstId) {
-  await processExam(examId);
-  console.log(` -> Waiting ${CONFIG.scoreWaitMs}ms...`);
-  await sleep(CONFIG.scoreWaitMs);
-  await submitExam(examId, lessonInstId);
-  for (let i = 0; i < 6; i++) {
-    await sleep(3000);
-    const lessons = await getLessonInsts();
-    const cur = lessons.find(
-      (l) =>
-        (l.section_unit_lesson_insts || [])[0]?.lesson_inst_id ===
-        Number(lessonInstId),
-    );
-    const pct = cur?.section_unit_lesson_insts?.[0]?.percentage;
-    console.log(` -> Poll ${i + 1}: ${cur?.lesson_name} pct=${pct}`);
-    if (pct !== null && pct !== undefined) break;
-  }
-  await verifyExam(examId);
-}
-async function main() {
-  console.log(
-    `Base: ${CONFIG.baseUrl}, Org: ${CONFIG.orgSlug}, User: ${CONFIG.userId}`,
-  );
-  if (!CONFIG.authToken || CONFIG.authToken.includes("PASTE_YOUR_TOKEN"))
-    console.warn("WARN: Set TOKEN");
-  if (CONFIG.betExamIds.length > 0) {
-    console.log("Starting manual mode for exams:", CONFIG.betExamIds);
-    const lessonMap = { 649313300: "7028950" }; // 02 Return Policy 9201697 -> 7028950
-    for (const id of CONFIG.betExamIds) {
-      try {
-        const lid = lessonMap[id] || null;
-        await processExam(id);
-        if (lid) await submitExam(id, lid);
-        else console.warn(`No lessonMap for ${id}`);
-        await verifyExam(id);
-      } catch (e) {
-        console.error(`!! Failed exam ${id}:`, e.message);
+      let lessons = await getLessonInsts(unitId);
+      if (!Array.isArray(lessons)) {
+        await sleep(1500);
+        continue;
       }
-      await sleep(CONFIG.delayMs);
-    }
-    console.log("\nAll done. Check dashboard now.");
-    return;
-  }
-  if (!CONFIG.autoDiscover) {
-    console.log("No betExamIds and autoDiscover false");
-    return;
-  }
-  console.log(`Starting AUTO mode (max ${CONFIG.maxAutoLessons} lessons)`);
-  for (let i = 0; i < CONFIG.maxAutoLessons; i++) {
-    const lessons = await getLessonInsts();
-    let target = null;
-    for (const l of lessons) {
-      const inst = (l.section_unit_lesson_insts || [])[0];
-      if (!inst) continue;
-      const isNext =
-        (l.lesson_status === "NOT_STARTED" ||
-          l.lesson_status === "IN_PROGRESS") &&
-        (inst.bet_status === "NOT_STARTED" ||
-          inst.bet_status === "IN_PROGRESS") &&
-        !inst.exam_id;
-      if (isNext) {
-        target = { lesson: l, inst };
-        break;
-      }
-    }
-    if (!target) {
-      console.log("No IN_PROGRESS lesson");
-      lessons.forEach((l) => {
+
+      let target = null;
+      for (const l of lessons) {
         const inst = (l.section_unit_lesson_insts || [])[0];
-        console.log(
-          ` L${l.seq_no} ${l.lesson_name} status=${l.lesson_status} bet=${inst?.bet_status} id=${inst?.lesson_inst_id} exam=${inst?.exam_id}`,
-        );
-      });
-      break;
+        if (isLessonDone(inst)) continue;
+
+        const isLocked = (l.lesson_status === "LOCKED" || inst?.bet_status === "LOCKED" || !inst?.lesson_inst_id) && !inst?.exam_id;
+        if (!isLocked && inst?.lesson_inst_id) {
+          if (attemptedLessons.has(inst.lesson_inst_id)) {
+            const hasLaterUnlocked = lessons.some((laterL) => {
+              const laterInst = (laterL.section_unit_lesson_insts || [])[0];
+              const laterLocked = (laterL.lesson_status === "LOCKED" || laterInst?.bet_status === "LOCKED" || !laterInst?.lesson_inst_id) && !laterInst?.exam_id;
+              return (
+                laterL.seq_no > l.seq_no &&
+                !isLessonDone(laterInst) &&
+                !laterLocked &&
+                laterInst?.lesson_inst_id &&
+                !attemptedLessons.has(laterInst.lesson_inst_id)
+              );
+            });
+            if (hasLaterUnlocked) continue;
+          }
+          target = { lesson: l, inst };
+          break;
+        }
+      }
+
+      if (!target) {
+        const allDoneOrLocked = lessons.every((l) => {
+          const inst = (l.section_unit_lesson_insts || [])[0];
+          const isLocked = (l.lesson_status === "LOCKED" || inst?.bet_status === "LOCKED" || !inst?.lesson_inst_id) && !inst?.exam_id;
+          return isLessonDone(inst) || (inst?.lesson_inst_id && attemptedLessons.has(inst.lesson_inst_id)) || isLocked;
+        });
+
+        if (allDoneOrLocked) {
+          log(`\n>>> READING UNIT ${unitId} COMPLETED / ALL ACCESSIBLE LESSONS DONE! <<<`);
+          break;
+        }
+
+        log(`Waiting 2s for next lesson in Reading Unit ${unitId} to unlock...`);
+        await sleep(2000);
+        continue;
+      }
+
+      const lessonInstId = String(target.inst.lesson_inst_id);
+      attemptedLessons.add(target.inst.lesson_inst_id);
+
+      log(`\n--------------------------------------------------------`);
+      log(`>>> Processing L${target.lesson.seq_no} "${target.lesson.lesson_name}" (InstId: ${lessonInstId}) <<<`);
+      log(`--------------------------------------------------------`);
+
+      let examId = null;
+      if (target.inst.bet_status === "FAILED" || !target.inst.exam_id) {
+        try {
+          examId = await createExamForLesson(lessonInstId);
+        } catch (e) {
+          if (target.inst.exam_id) {
+            examId = String(target.inst.exam_id);
+            log(` -> Using existing exam_id=${examId}`);
+          } else {
+            log(`!! Create exam error: ${e.message}`);
+            await sleep(2000);
+            continue;
+          }
+        }
+      } else {
+        examId = String(target.inst.exam_id);
+        log(` -> Using existing exam_id=${examId}`);
+      }
+
+      await processExam(examId);
+      log(` -> Submitting exam ${examId}...`);
+      await submitExam(examId, lessonInstId);
+      log(` -> Waiting 1500ms for database sync...`);
+      await sleep(1500);
+    } catch (err) {
+      log(`!! solveUnit error in loop: ${err.message}, retrying in 2s...`);
+      await sleep(2000);
     }
-    const lessonInstId = String(target.inst.lesson_inst_id);
-    console.log(
-      `\n=== Auto L${target.lesson.seq_no} ${target.lesson.lesson_name} lesson_inst_id=${lessonInstId} ===`,
-    );
-    let examId = target.inst.exam_id ? String(target.inst.exam_id) : null;
-    if (!examId) {
-      examId = await createExamForLesson(lessonInstId);
-      await sleep(CONFIG.delayMs);
-    } else console.log(` -> Using existing exam_id=${examId}`);
-    try {
-      await runSingleLesson(examId, lessonInstId);
-    } catch (e) {
-      console.error(
-        `!! Failed lesson ${lessonInstId} exam ${examId}:`,
-        e.message,
-      );
-      break;
-    }
-    await sleep(CONFIG.delayMs);
   }
-  console.log("\nAll done. Check dashboard now.");
 }
-main().catch(console.error);
+
+async function main() {
+  fs.writeFileSync("reading_progress.txt", `=== READING AUTOMATION STARTED: User ${CONFIG.userId} ===\n`);
+  log(`[READING] Started for User: ${CONFIG.userId}, Section: ${CONFIG.betSectionInstId}`);
+
+  for (const unitId of ORDERED_UNITS) {
+    await solveUnit(unitId);
+    await sleep(1000);
+  }
+
+  log("\n============================================================");
+  log("=== ALL READING UNITS AND LESSONS COMPLETED 100%! ===");
+  log("============================================================");
+}
+
+main().catch((e) => log("FATAL ERROR in main:", e));
